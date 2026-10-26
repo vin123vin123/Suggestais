@@ -15,7 +15,7 @@ else:
     st.error("🔑 API Key missing! Please add 'OPENROUTER_API_KEY' to your Streamlit secrets.")
     st.stop()
 
-# 3. Database Initialization & Utilities
+# 3. Database Utilities
 def init_db():
     conn = sqlite3.connect("chat_history.db")
     c = conn.cursor()
@@ -53,20 +53,25 @@ def clear_db():
     conn.commit()
     conn.close()
 
-# Start the DB layout
 init_db()
 
 # 4. Sidebar Interface Controls
 with st.sidebar:
     st.header("Configuration")
     st.success("🔒 API Key loaded securely from Secrets.")
-    st.info("System Route: openrouter/free (Auto-selects active free models)")
+    
+    # Let the user choose between the universal path and a direct specific backup model
+    model_choice = st.selectbox(
+        "Choose Free Route",
+        options=["openrouter/free", "google/gemini-2.5-flash:free"],
+        help="If openrouter/free gives a gateway HTML error, switch to a specific model directly."
+    )
     
     st.header("Database Controls")
     if st.button("🗑️ Clear Saved History", type="primary"):
         clear_db()
         st.session_state.messages = []
-        st.success("Chat history cleared from database!")
+        st.success("Chat history cleared!")
         st.rerun()
 
 # 5. Load Stored Conversations
@@ -80,31 +85,31 @@ for message in st.session_state.messages:
 
 # 7. Core Prompt Feeder & Action Framework
 if prompt := st.chat_input("What is on your mind?"):
-    
-    # Save user message to UI state and the SQLite file
     st.session_state.messages.append({"role": "user", "content": prompt})
     save_message_to_db("user", prompt)
     
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 8. API Engine Run & Output Pipeline
+    # 8. API Engine Run with Content-Type and HTML Verification Interceptors
     with st.chat_message("assistant"):
         try:
             http_client = httpx.Client(timeout=httpx.Timeout(45.0, connect=10.0))
             
             client = OpenAI(
-                base_url="https://openrouter.ai",
+                base_url="https://openrouter.ai/api/v1",
                 api_key=api_key,
                 http_client=http_client,
                 default_headers={
+                    # Explicitly inform the endpoint firewall to expect standard JSON payloads
+                    "Accept": "application/json",
                     "HTTP-Referer": "http://localhost:8501", 
                     "X-Title": "Streamlit Free App"      
                 }
             )
             
             response = client.chat.completions.create(
-                model="openrouter/free",
+                model=model_choice,
                 messages=[
                     {"role": m["role"], "content": m["content"]}
                     for m in st.session_state.messages
@@ -112,9 +117,12 @@ if prompt := st.chat_input("What is on your mind?"):
                 stream=True
             )
             
-            # Unpacks the stream chunks safely if OpenRouter returns lists
             def response_generator():
                 for chunk in response:
+                    # CATCHING THE FIREWALL ERROR: Verify the incoming block is not an unparsed string containing HTML markup tags
+                    if isinstance(chunk, str) and ("<!DOCTYPE" in chunk or "<html" in chunk):
+                        raise ValueError("OpenRouter returned an HTML error gateway page instead of structural AI tokens.")
+                        
                     if hasattr(chunk, 'choices') and chunk.choices and len(chunk.choices) > 0:
                         first_choice = chunk.choices[0]
                         delta = first_choice.get('delta', None) if isinstance(first_choice, dict) else getattr(first_choice, 'delta', None)
@@ -126,9 +134,15 @@ if prompt := st.chat_input("What is on your mind?"):
             # Stream out the text response live
             full_response = st.write_stream(response_generator())
             
-            # Finalize entries in local memory arrays and SQL database
             st.session_state.messages.append({"role": "assistant", "content": full_response})
             save_message_to_db("assistant", full_response)
             
         except Exception as e:
-            st.error(f"Execution Error: {str(e)}")
+            error_msg = str(e)
+            if "<!DOCTYPE" in error_msg or "HTML" in error_msg:
+                st.error("⚠️ **OpenRouter Connection Blocked (HTML Gateway Error)**")
+                st.info("💡 **How to fix this right now:**\n"
+                        "1. Open the sidebar and change the **Choose Free Route** dropdown to a specific model like `google/gemini-2.5-flash:free`.\n"
+                        "2. Make sure your OpenRouter API key inside your secrets configuration is valid, active, and contains active free credits.")
+            else:
+                st.error(f"Execution Error: {error_msg}")
